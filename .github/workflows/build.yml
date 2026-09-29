@@ -1,0 +1,81 @@
+name: Build feed
+
+on:
+  schedule:
+    - cron: '0 16 * * *'   # 02:00 Brisbane time, every night
+  workflow_dispatch:        # "Run workflow" button
+  push:
+    branches: [main]
+    paths: [sources.json, build.py, discover.py]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cache from the db branch
+        run: |
+          mkdir -p cache
+          if git fetch --depth 1 origin db 2>/dev/null; then
+            for f in files.json mame_games.json mame_drivers.json; do
+              git show FETCH_HEAD:cache/$f > cache/$f 2>/dev/null || rm -f cache/$f
+            done
+            git show FETCH_HEAD:db.json.zip > previous_db.json.zip 2>/dev/null || true
+          fi
+
+      - name: Build database
+        run: python3 build.py
+
+      - name: Look for new core repos
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 discover.py || echo "discovery failed, continuing"
+
+      - name: Publish to the db branch
+        run: |
+          # Keep the old timestamp when nothing changed, so MiSTers don't re-check for no reason
+          python3 - <<'EOF'
+          import json, zipfile, os
+          def files(p):
+              z = zipfile.ZipFile(p); return json.loads(z.read(z.namelist()[0]))
+          if os.path.exists('previous_db.json.zip'):
+              old, new = files('previous_db.json.zip'), files('out/db.json.zip')
+              if old['files'] == new['files'] and old['folders'] == new['folders']:
+                  new['timestamp'] = old['timestamp']
+                  with zipfile.ZipFile('out/db.json.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+                      z.writestr('db.json', json.dumps(new, sort_keys=True))
+          EOF
+          mkdir -p publish/cache
+          cp out/db.json.zip out/REPORT.md publish/
+          cp out/CANDIDATES.md publish/ 2>/dev/null || true
+          cp cache/files.json cache/mame_games.json cache/mame_drivers.json publish/cache/ 2>/dev/null || true
+          cd publish
+          git init -q -b db
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Feed build $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" db
+
+      - name: Flag new core repos in an issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -f out/CANDIDATES.md ] || exit 0
+          grep -q '^| \[' out/CANDIDATES.md || exit 0
+          gh label create new-cores --color 1d76db 2>/dev/null || true
+          n=$(gh issue list --state open --label new-cores --json number -q '.[0].number' || true)
+          if [ -n "$n" ]; then
+            gh issue edit "$n" --body-file out/CANDIDATES.md
+          else
+            gh issue create --title "New arcade cores to review" --label new-cores --body-file out/CANDIDATES.md
+          fi
