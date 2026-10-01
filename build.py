@@ -125,12 +125,15 @@ def get_bytes_and_meta(key, url, want_content):
 
 def parse_mra(key, url):
     c = file_cache.get(key, {})
-    if 'mra' in c:
+    if 'mra' in c and 'error' not in c['mra']:
         return c['mra'], c['md5'], c['size']
     data, md5, size = get_bytes_and_meta(key, url, True)
+    text = data.decode('utf-8', errors='replace').lstrip('﻿')
+    # Some MRAs put comments before the <?xml?> declaration, which strict XML rejects: drop the declaration.
+    text = re.sub(r'<\?xml[^>]*\?>', '', text)
     info = {'rbf': None, 'setname': None, 'rotation': None, 'name': None, 'zips': []}
     try:
-        root = ET.fromstring(data.decode('utf-8', errors='replace').lstrip('﻿'))
+        root = ET.fromstring(text.strip())
         info['rbf'] = (root.findtext('rbf') or '').strip() or None
         info['setname'] = (root.findtext('setname') or '').strip() or None
         info['rotation'] = (root.findtext('rotation') or '').strip() or None
@@ -141,7 +144,14 @@ def parse_mra(key, url):
                 info['zips'] += [p.strip()[:-4] if p.strip().lower().endswith('.zip') else p.strip()
                                  for p in z.split('|') if p.strip()]
     except ET.ParseError as e:
-        info['error'] = str(e)
+        # Last resort: pull the few tags we need with regexes.
+        for tag in ('rbf', 'setname', 'rotation', 'name'):
+            m = re.search(rf'<{tag}>\s*([^<]+?)\s*</{tag}>', text, re.I)
+            info[tag] = m.group(1) if m else None
+        info['zips'] = [z[:-4] if z.lower().endswith('.zip') else z
+                        for zs in re.findall(r'zip="([^"]+)"', text) for z in zs.split('|')]
+        if not info['rbf']:
+            info['error'] = str(e)
     file_cache[key]['mra'] = info
     return info, md5, size
 
@@ -207,33 +217,41 @@ def list_github(repo):
     """Blob-less shallow clone, return (commit, [(path, blob_sha, size)])."""
     d = CLONES / repo.replace('/', '__')
     url = f'https://github.com/{repo}'
+    # Never prompt for credentials: a missing repo should fail, not pop up a login.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GCM_INTERACTIVE='never')
+
+    def git(*args, **kw):
+        r = subprocess.run(['git', *args], capture_output=True, text=True, encoding='utf-8', env=env, **kw)
+        if r.returncode:
+            raise RuntimeError(f'git {args[0]} failed ({r.returncode}): {r.stderr.strip()[:200]}')
+        return r.stdout
+
     if d.exists():
-        subprocess.run(['git', '-C', str(d), 'fetch', '-q', '--depth', '1', '--filter=blob:none', 'origin', 'HEAD'],
-                       check=True, capture_output=True)
+        git('-C', str(d), 'fetch', '-q', '--depth', '1', '--filter=blob:none', 'origin', 'HEAD')
         ref = 'FETCH_HEAD'
     else:
-        subprocess.run(['git', 'clone', '-q', '--depth', '1', '--filter=blob:none', '--no-checkout', url, str(d)],
-                       check=True, capture_output=True)
+        git('clone', '-q', '--depth', '1', '--filter=blob:none', '--no-checkout', url, str(d))
         ref = 'HEAD'
-    commit = subprocess.run(['git', '-C', str(d), 'rev-parse', ref], check=True, capture_output=True,
-                            text=True).stdout.strip()
-    out = subprocess.run(['git', '-C', str(d), 'ls-tree', '-r', '-l', commit], check=True, capture_output=True,
-                         text=True, encoding='utf-8').stdout
+    commit = git('-C', str(d), 'rev-parse', ref).strip()
+    # No '-l': asking for sizes would make a blob-less clone download every file. Sizes come from the download.
     files = []
-    for line in out.splitlines():
+    for line in git('-C', str(d), 'ls-tree', '-r', commit).splitlines():
         meta, path = line.split('\t', 1)
-        _mode, typ, sha, size = meta.split()
+        _mode, typ, sha = meta.split()
         if typ == 'blob':
-            files.append((path, sha, int(size)))
+            files.append((path, sha, None))
     return commit, files
 
 
 def release_files(paths):
     """Pick the folder(s) that hold the release: prefer dirs named release(s)/_Arcade; skip sims/tests/docs."""
-    skip = re.compile(r'(^|/)(sim|test|tests|tb|docs?|tools|scripts|work|build|output_files|\.github)(/|$)', re.I)
-    cand = [p for p in paths if not skip.search(p)]
-    pref = [p for p in cand if re.search(r'(^|/)(releases?|_Arcade|mra)(/|$)', p, re.I)]
-    return pref or cand
+    skip = re.compile(r'(^|/)(_?dev|debug|old|archive|wip|sim|test|tests|tb|docs?|tools|scripts|work|build|output_files|\.github)(/|$)', re.I)
+    cand = [p for p in paths if not skip.search(p)] or         [p for p in paths if re.search(r'(^|/)output_files/', p)]
+    for pattern in (r'(^|/)releases?(/|$)', r'(^|/)_Arcade(/|$)', r'(^|/)mra(/|$)'):
+        pref = [p for p in cand if re.search(pattern, p, re.I)]
+        if pref:
+            return pref
+    return cand
 
 
 def collect_github(src):
@@ -282,7 +300,7 @@ def latest_rbfs(rbfs):
 # ---------------------------------------------------------------- official data
 
 def official_data(cfg):
-    titles, setnames, rbf_names = {}, {}, {}
+    titles, setnames, rbf_names, mra_files = {}, {}, {}, {}
     for label, url in cfg['official_dbs'].items():
         try:
             db = load_db(url)
@@ -293,6 +311,7 @@ def official_data(cfg):
             name = path.rsplit('/', 1)[-1]
             if name.lower().endswith('.mra'):
                 titles.setdefault(norm_title(name[:-4]), label)
+                mra_files.setdefault(name.lower(), label)
             elif name.lower().endswith('.rbf') and path.lower().startswith('_arcade/cores/'):
                 rbf_names.setdefault(rbf_base(name), label)
     # MAD DB: the arcade database Update All's organizer uses, keyed by setname.
@@ -300,9 +319,11 @@ def official_data(cfg):
         ua = json.loads(fetch(cfg['update_all_db']))
         mad_url = next(v['url'] for p, v in ua['files'].items() if p.endswith('mad_db.json.zip'))
         mad = load_db(mad_url)
+        # MAD DB also covers community cores, so only trust a setname whose game file is in an official feed.
         for s, v in mad.items():
-            if s:
-                setnames.setdefault(s, 'official (MAD DB: ' + v.get('file', '') + ')')
+            f = (v.get('file') or '').lower()
+            if s and f in mra_files:
+                setnames.setdefault(s, f'{mra_files[f]} ({v.get("file")})')
     except Exception as e:
         log(f'! MAD DB unavailable: {e}')
     return titles, setnames, rbf_names
@@ -413,11 +434,21 @@ def main():
             for m, info, md5, size in parsed:
                 tag = info.get('rbf')
                 match = [r for r in rbfs if tag and rbf_matches(tag, r['path'].rsplit('/', 1)[-1])]
+                if not match and tag:
+                    # Developer named the file differently from what the MRA asks for (e.g. MRA wants
+                    # 'Arcade-SegaVCO', file is 'SegaVCO_20260801.rbf'): install it under the name the MRA expects.
+                    bare = lambda x: re.sub(r'^arcade-', '', x.lower())
+                    loose = [r for r in rbfs if bare(rbf_base(r['path'].rsplit('/', 1)[-1])) == bare(tag)]
+                    if loose:
+                        r0 = max(loose, key=lambda r: r['path'].rsplit('/', 1)[-1])
+                        fname = r0['path'].rsplit('/', 1)[-1]
+                        suffix = DATE_SUFFIX.search(fname[:-4])
+                        match = [dict(r0, dest_name=tag + (suffix.group(0) if suffix else '') + '.rbf')]
                 if not match:
                     report['norbf'].append(f'{m["path"]} [{sid}]: needs core "{tag}", not found in this source')
                     continue
                 r = max(match, key=lambda r: r['path'].rsplit('/', 1)[-1])
-                b = rbf_base(r['path'].rsplit('/', 1)[-1])
+                b = rbf_base(r.get('dest_name') or r['path'].rsplit('/', 1)[-1])
                 clash = [ob for ob in off_rbfs if rbf_matches(tag, ob + '_x') or ob == b]
                 if clash:
                     report['conflict'].append(f'{m["path"]} [{sid}]: core "{tag}" clashes with official core {clash[0]}')
@@ -448,14 +479,14 @@ def main():
                 else:
                     dest = f'{beta}/{folder}/{fname}'
                 files[dest] = {'hash': md5, 'size': size, 'url': qurl(m['url'])}
-                needed_rbfs[rbf_base(r['path'].rsplit('/', 1)[-1])] = r
+                needed_rbfs[rbf_base(r.get('dest_name') or r['path'].rsplit('/', 1)[-1])] = r
             seen_titles[gkey] = sid
             src_included += 1
             report['included'].append((orient or 'Unsorted', title, sid, len(ok_members)))
 
         for b, r in needed_rbfs.items():
             _, md5, size = get_bytes_and_meta(r['key'], r['url'], False)
-            dest = f'_Arcade/cores/{r["path"].rsplit("/", 1)[-1]}'
+            dest = f'_Arcade/cores/{r.get("dest_name") or r["path"].rsplit("/", 1)[-1]}'
             files[dest] = {'hash': md5, 'size': size, 'url': qurl(r['url']), 'tangle': [b + '_core']}
             used_rbf_bases[b] = sid
         report['sources'].append((sid, version, src_included, len(needed_rbfs)))
